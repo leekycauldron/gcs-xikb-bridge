@@ -7,7 +7,7 @@ from google.cloud import storage
 import functions_framework
 
 # CONFIG & CONSTANTS
-ELEVENLABS_API_KEY = os.getenv('XI_API_KEY')
+ELEVENLABS_API_KEY = os.getenv('ELEVEN_LABS_API_KEY')
 ELEVENLABS_AGENT_ID = os.getenv('AGENT_ID')
 ELEVENLABS_API_URL = "https://api.elevenlabs.io/v1"
 
@@ -17,7 +17,7 @@ storage_client = storage.Client()
 def get_elevenlabs_docs():
     """Fetches all documents currently in the ElevenLabs Knowledge Base."""
     headers = {"xi-api-key": ELEVENLABS_API_KEY}
-    documents = {} # Mapping: filename -> doc_id
+    documents = {} 
     
     next_cursor = None
     while True:
@@ -58,25 +58,41 @@ def delete_elevenlabs_doc(doc_id):
         print(f"Failed to delete doc {doc_id}: {response.text}")
 
 def upload_file_to_elevenlabs(bucket_name, blob_name):
-    """Downloads file from GCS and uploads to ElevenLabs with correct MIME type."""
+    """Downloads file from GCS and uploads to ElevenLabs with strict MIME type mapping."""
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
     
-    # NEW: Detect the file type dynamically
-    content_type, _ = mimetypes.guess_type(blob_name)
-    if content_type is None:
-        content_type = 'application/octet-stream' # Fallback for unknown types
+    # 1. Map extensions to ElevenLabs specific allowed types
+    ext_mapping = {
+        '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        '.pdf': 'application/pdf',
+        '.txt': 'text/plain',
+        '.epub': 'application/epub+zip',
+        '.html': 'text/html',
+        '.md': 'text/markdown'
+    }
     
+    _, ext = os.path.splitext(blob_name.lower())
+    content_type = ext_mapping.get(ext)
+    
+    # Fallback to mimetypes if not in our manual list
+    if not content_type:
+        content_type, _ = mimetypes.guess_type(blob_name)
+        if not content_type:
+            content_type = 'text/plain' # Safest fallback for LLM ingestion
+
     _, temp_local_filename = tempfile.mkstemp()
     
     try:
         blob.download_to_filename(temp_local_filename)
         headers = {"Xi-api-key": ELEVENLABS_API_KEY}
-        args = {'name': blob_name} 
+        
+        # We send only the filename, not the full GCS path/folder structure if present
+        display_name = os.path.basename(blob_name)
+        args = {'name': display_name} 
         
         with open(temp_local_filename, 'rb') as f:
-            # CHANGED: Use the detected content_type instead of hardcoded 'text/plain'
-            files = {'file': (blob_name, f, content_type)}
+            files = {'file': (display_name, f, content_type)}
             response = requests.post(
                 f"{ELEVENLABS_API_URL}/convai/knowledge-base/file",
                 headers=headers,
@@ -86,7 +102,7 @@ def upload_file_to_elevenlabs(bucket_name, blob_name):
             
         if response.status_code == 200:
             data = response.json()
-            print(f"Uploaded {blob_name} ({content_type}), ID: {data['id']}")
+            print(f"Uploaded {display_name} as {content_type}, ID: {data['id']}")
             return data['id']
         else:
             print(f"Failed to upload {blob_name}: {response.text}")
@@ -108,9 +124,9 @@ def update_agent_knowledge(valid_docs):
             headers=headers
         )
         if get_resp.status_code != 200:
-            print(f"Warning: Could not fetch agent ({get_resp.status_code}). Proceeding with overwrite.")
+            print(f"Warning: Could not fetch agent ({get_resp.status_code}). Proceeding with update.")
     except Exception as e:
-         print(f"Exception fetching agent: {e}. Proceeding with overwrite.")
+         print(f"Exception fetching agent: {e}. Proceeding with update.")
 
     new_kb_config = []
     for doc in valid_docs:
